@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr 25 16:33:09 2023
+
+@author: aparrar1
+
+Functions for file query and data download from Copernicus Data
+The Copernicus Open Access Hub uses 2 API to create queries and download requests in non-interactive scripts
+This scripts uses the python library "requests" to submit a query request to the OpenSearch URI and extract the file names and download links
+Then, the same library is used to submit a download request to the OData URI to download the Sentinel files
+"""
+
+import os
+import sys
+import requests
+from shapely.geometry import Polygon
+import geopandas as gp
+import shutil
+import numpy as np
+import re
+from osgeo import gdal
+import subprocess
+import rasterio
+from rasterio import crs
+from rasterio.merge import merge
+from zipfile import ZipFile
+
+def runcmd(cmd, verbose = False, *args, **kwargs):
+
+    process = subprocess.Popen(
+        cmd,
+        stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE,
+        text = True,
+        shell = True
+    )
+    std_out, std_err = process.communicate()
+    if verbose:
+        print(std_out.strip(), std_err)
+        return(std_out.strip())
+    pass
+
+def get_keycloak(username: str, password: str) -> str:
+    #This code was taken from https://documentation.dataspace.copernicus.eu/APIs/Token.html
+    #The code was modified to also extract the refresh token
+    data = {
+        "client_id": "cdse-public",
+        "username": username,
+        "password": password,
+        "grant_type": "password",
+        }
+    try:
+        r = requests.post("https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token",
+        data=data,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise Exception(
+            f"Keycloak token creation failed. Reponse from the server was: {r.json()}"
+            )
+    tokens=[r.json()["access_token"],r.json()["refresh_token"]]
+    return tokens
+        
+def ROI_to_BBOX(ROI_file):
+#function for getting the bounding box from a shapefile or a list of upper left, lower right coordinates.
+#Get the coordinates information from the ROI BBOX
+#Make sure the CRS is WGS84, if not, reproject to WGS84
+    if "/" in ROI_file:    
+        if ROI_file.endswith('json') or ROI_file.endswith('.shp'):
+            try:
+                ROI = gp.GeoDataFrame.from_file(ROI_file)
+                if ROI.crs != 'EPSG:4326':
+                    ROI = ROI.to_crs("EPSG:4326")
+                if len(ROI) > 1:
+                    print('Multi-feature polygon detected. Only the first feature will be used to subset the data.')
+                    ROI = ROI.iloc[[0]]
+            except:
+                print('error: unable to read input geojson file or the file was not found')
+                sys.exit(2)
+    else:
+        if type(ROI_file) == list:
+            try:
+                ROI = Polygon([(ROI_file[1], ROI_file[0]), (ROI_file[3], ROI_file[0]), (ROI_file[3], ROI_file[2]), (ROI_file[1], ROI_file[2])]) 
+                ROI = gp.GeoDataFrame(index=[0], geometry=[ROI]) 
+                ROI.crs = 'EPSG:4326'
+            except:
+                print('error: unable to read input bounding box coordinates, the required format is: ul_lat,ul_lon,lr_lat,lr_lon')
+                sys.exit(2)
+    return(ROI)
+
+def CopernicusData_query_wrapper(ROI_file, output_directory, platformname='',producttype='', time_start='2014-01-01T00:00:00.000Z', time_end='2023-01-01T00:00:00.000Z',save_output=True, file_name='file_query'):
+#Code for querying the Copernicus Open Access Hub using the OpenSearch API.
+#-----------------------------Step 1------------------------------
+#Make sure the platform name is included
+#SENTINEL-1, SENTINEL-2, SENTINEL-3
+    if platformname=='' :
+        print('error: Platform name not defined')
+        sys.exit(2)
+#-----------------------------Step 2------------------------------
+#Get the coordinates information from the ROI BBOX
+#Make sure the CRS is WGS84, if not, reproject to WGS84
+    BBOX=ROI_to_BBOX(ROI_file)
+    BBOX=BBOX.total_bounds
+    lon=[BBOX[0],BBOX[2]] 
+    lat=[BBOX[1],BBOX[3]]
+    final_bbox=str(min(lon))+" "+str(min(lat))+","+str(min(lon))+" "+str(max(lat))+","+str(max(lon))+" "+str(max(lat))+","+str(max(lon))+" "+str(min(lat))+","+str(min(lon))+" "+str(min(lat))  
+#---------------------------------Step 3---------------------------------
+#Construct the URL link
+    CMR_URL = 'https://catalogue.dataspace.copernicus.eu/odata/v1/Products'
+
+    CMR_FILE_URL = ('{0}?$filter=Collection/Name eq \'{1}\''.format(CMR_URL,platformname))
+    params = ' and ContentDate/Start gt {0}'.format(time_start)
+    params += ' and ContentDate/Start lt {0}'.format(time_end)
+    params += ' and OData.CSC.Intersects(area=geography\'SRID=4326;POLYGON(({0}))\')'.format(final_bbox)
+    if not producttype=='':
+        params += ' and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq \'productType\' and att/OData.CSC.StringAttribute/Value eq \'{0}\')'.format(producttype)
+
+    cmr_query_url =CMR_FILE_URL + params
+    response= requests.get(cmr_query_url)
+    cmr_info=response.json()
+    cmr_info=cmr_info['value']
+#---------------------------------Step 4---------------------------------
+#Get the available files that overlap the ROI and save or return the list
+    if len(cmr_info)==0:
+        print('No files available for the search parameters')
+        sys.exit(2)   
+    result=[]
+    for i in range(len(cmr_info)):
+        result.append(cmr_info[i]['Name']+" "+cmr_info[i]['Id'])
+    if save_output==True:
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory)
+        save_file=output_directory+'/'+file_name
+        avail_files=open(save_file, "w") 
+        for i in range(len(result)):
+            avail_files.write(result[i]+"\n")
+        avail_files.close()
+    print("A total of "+str(len(result))+' files overlap the ROI')
+    return(result)
+
+def CopernicusData_download(f, temporary_directory,token='', refresh_token=''): 
+#Code for downloading the available files for the ROI
+    if token=='':
+        print('error: authorization token not defined check: https://documentation.dataspace.copernicus.eu/APIs/OData.html')
+        sys.exit(2)
+    if not os.path.exists(temporary_directory):
+        os.makedirs(temporary_directory)
+    file_name=f.split(' ')[0]
+    file_product=re.sub("\"", '',f.split(' ')[1])
+    saveName = os.path.join(temporary_directory, file_name.strip()+'.zip')   
+    # Create and submit request and download file
+    #Construct the URL link
+    CMR_URL = 'https://catalogue.dataspace.copernicus.eu/odata/v1/Products'
+    params = '({0})/$value'.format(file_product)
+    cmr_download_url =CMR_URL + params
+    with requests.get(cmr_download_url.strip(), verify=False, stream=True,headers={'Authorization': "Bearer {}".format(token)}) as response:
+        if response.status_code != 200:
+            print("{} not downloaded. Verify that your token is correct and not expired".format(file_name.strip()))
+            if not refresh_token=='':
+                print('trying the refresh token')
+                comand="curl --location --request POST \'https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token\' --header \'Content-Type: application/x-www-form-urlencoded\' --data-urlencode \'grant_type=refresh_token\' "
+                params_comand = '--data-urlencode \'refresh_token={0}\' --data-urlencode \'client_id=cdse-public\' '.format(refresh_token)
+                final_comand=comand + params_comand
+                new_token=runcmd(final_comand, verbose = True)
+                new_token2=re.sub('{"access_token|:|\"','',new_token.split(',')[0])
+                with requests.get(cmr_download_url.strip(), verify=False, stream=True,headers={'Authorization': "Bearer {}".format(new_token2)}) as response:
+                    if response.status_code != 200:
+                        print("{} not downloaded. Verify that your token is correct and not expired".format(file_name.strip()))     
+                    else:
+                        response.raw.decode_content = True
+                        content = response.raw
+                        with open(saveName, 'wb') as d:
+                            shutil.copyfileobj(content, d)
+                            print('Downloaded file: {}'.format(saveName))
+        else:
+            response.raw.decode_content = True
+            content = response.raw
+            with open(saveName, 'wb') as d:
+                shutil.copyfileobj(content, d)
+            print('Downloaded file: {}'.format(saveName))
+
+def Sentinel2_extract(input_file, output_directory, output=False): 
+#Extract the 10 m bands of a Sentinel2 image
+    if input_file=='' or output_directory=='':
+        print('error: Input data is missing')
+        sys.exit(2)
+    if not os.path.exists(input_file):
+        print('error: Input data file not found')
+        sys.exit(2)
+#Create the output directory if it does not exist
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    #Get the file name
+    file_name=re.sub(".zip", "",input_file.split("/")[-1])
+    image = gdal.Open(input_file)
+    subdatasets = image.GetSubDatasets()
+    data_10m= subdatasets[0][0] #Bands B2, B3, B4, B8 with 10m resolution
+    data_10_bands=gdal.Open(data_10m, gdal.GA_ReadOnly)
+    data_10_bands_array=data_10_bands.ReadAsArray()
+    #Get the projection info
+    sentinel_crs = crs.CRS.from_string(data_10_bands.GetProjection())
+    #Get the information of the 10m images 
+    transform_gdal = data_10_bands.GetGeoTransform()
+    transform=rasterio.Affine(transform_gdal[1],transform_gdal[2],transform_gdal[0],transform_gdal[4],transform_gdal[5],transform_gdal[3])  
+    output_image=output_directory+file_name+'.tif'
+    result_file = rasterio.open(output_image,'w',driver='GTiff',
+                            height=data_10_bands_array.shape[1],width=data_10_bands_array.shape[2],count=4,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform)
+    result_file.write(data_10_bands_array[0],1)
+    result_file.write(data_10_bands_array[1],2)
+    result_file.write(data_10_bands_array[2],3)
+    result_file.write(data_10_bands_array[3],4)
+    result_file.close()
+    print("Image "+file_name+" extraction complete")
+    if output==True:
+        return(data_10_bands_array)
+
+def Sentinel2_L1C_preprocess(input_file, temporary_directory, output_directory, output=False): 
+#Sentinel 2 L1C data preprocess workflow.
+#Unzip the Sentinel2 L1C file
+#Construct a cloud image using fmask https://github.com/ubarsc/python-fmask/releases
+#Use GDAL to read the zipped files and extract the files needed
+#Extract the 10 m bands 
+#Transform the cloud image to 10 m resolution
+#Mask the cloud areas
+#Save the clean image with the selected bands
+    if input_file=='' or temporary_directory=='' or output_directory=='':
+        print('error: Input data is missing')
+        sys.exit(2)
+    if not os.path.exists(input_file):
+        print('error: Input data file not found')
+        sys.exit(2)
+#Create the temporary and output directory if they do not exist
+    if not os.path.exists(temporary_directory):
+        os.makedirs(temporary_directory)
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    #Get the file name
+    file_name=re.sub(".SAFE.zip", "",input_file.split("/")[-1])
+    #Unzip the file
+    zf = ZipFile(input_file, 'r')
+    zf.extractall(os.path.dirname(input_file))
+    zf.close()
+    #Contruct the command for the fmask process
+    safe_file=re.sub(".zip", "",input_file)
+    cloud_file=temporary_directory+file_name+"_cloud_mask.img"
+    comand="fmask_sentinel2Stacked.py -o {0} --safedir {1}".format(cloud_file,safe_file)
+    runcmd(comand, verbose = True)
+    #Open the Sentinel2 image
+    image = gdal.Open(input_file)
+    subdatasets = image.GetSubDatasets()
+    data_10m= subdatasets[0][0] #Bands B2, B3, B4, B8 with 10m resolution
+    data_10_bands=gdal.Open(data_10m, gdal.GA_ReadOnly)
+    data_10_bands_array=data_10_bands.ReadAsArray()
+    #Get the projection info
+    sentinel_crs = crs.CRS.from_string(data_10_bands.GetProjection())
+    #Resample the cloud image to the 10 m pixel scale
+    transform_gdal = data_10_bands.GetGeoTransform()
+    transform=rasterio.Affine(transform_gdal[1],transform_gdal[2],transform_gdal[0],transform_gdal[4],transform_gdal[5],transform_gdal[3])  
+    minx = transform_gdal[0]
+    maxy = transform_gdal[3]
+    maxx = minx + transform_gdal[1] * data_10_bands.RasterXSize
+    miny = maxy + transform_gdal[5] * data_10_bands.RasterYSize
+    options="-te {0} {1} {2} {3} -ts {4} {5}".format(minx,miny,maxx,maxy,data_10_bands.RasterXSize,data_10_bands.RasterYSize)
+    final_mask=temporary_directory+file_name+'_mask_10m.tif'
+    mask = gdal.Warp(final_mask,cloud_file, options=options)
+    mask_array=mask.ReadAsArray()
+    mask_array[mask_array<2]=1
+    mask_array[mask_array>3]=1
+    mask_array[mask_array>1]=0
+    mask_file2=temporary_directory+file_name+'_mask_binary.tif'
+    result_file = rasterio.open(mask_file2,'w',driver='GTiff',
+                            height=mask_array.shape[0],width=mask_array.shape[1],count=1,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform)
+    result_file.write(mask_array,1)
+    result_file.close()
+    final_image=data_10_bands_array*mask_array
+    clean_image=output_directory+file_name+'.tif'
+    result_file = rasterio.open(clean_image,'w',driver='GTiff',
+                            height=final_image.shape[1],width=final_image.shape[2],count=4,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform)
+    result_file.write(final_image[0],1)
+    result_file.write(final_image[1],2)
+    result_file.write(final_image[2],3)
+    result_file.write(final_image[3],4)
+    result_file.close()
+    print("Image "+file_name+" preprocess complete")
+    if output==True:
+        return(final_image)
+
+def Sentinel2_L2A_preprocess(input_file, temporary_directory, output_directory, output=False): 
+#Sentinel 2 data preprocess workflow.
+#AOT: Aerosol Optical Thickness map (at 550nm)
+#CLD: Raster mask values range from 0 for high confidence clear sky to 100 for high confidence cloudy
+#SCL: Scene Classification. The meaning of the values is indicated in the Category Names of the band.
+#SNW: Raster mask values range from 0 for high confidence NO snow/ice to 100 for high confidence snow/ice
+#WVP: Scene-average Water Vapour map
+#Use GDAL to read the zipped files and extract the files needed
+#Extract the 10 m and the 20 m bands (for the SCL) 
+#Mask the cloud areas
+#Save the clean image with the selected bands
+    if input_file=='' or temporary_directory=='' or output_directory=='':
+        print('error: Input data is missing')
+        sys.exit(2)
+    if not os.path.exists(input_file):
+        print('error: Input data file not found')
+        sys.exit(2)
+#Create the temporary and output directory if they do not exist
+    if not os.path.exists(temporary_directory):
+        os.makedirs(temporary_directory)
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    #Get the file name
+    file_name=re.sub(".zip", "",input_file.split("/")[-1])
+    image = gdal.Open(input_file)
+    subdatasets = image.GetSubDatasets()
+    data_10m= subdatasets[0][0] #Bands B2, B3, B4, B8 with 10m resolution
+    data_20m= subdatasets[1][0] #Bands B5, B6, B7, B8A, B11, B12, AOT, CLD, SCL, SNW, WVP with 20m resolution
+    data_10_bands=gdal.Open(data_10m, gdal.GA_ReadOnly)
+    data_10_bands_array=data_10_bands.ReadAsArray()
+    data_20_bands=gdal.Open(data_20m, gdal.GA_ReadOnly)
+    #Get the projection info
+    sentinel_crs = crs.CRS.from_string(data_10_bands.GetProjection())
+    #Get the Scene Clasification layer band
+    SCL =data_20_bands.GetRasterBand(9).ReadAsArray()
+    #Save the SLC as a temporaty file, and resample it to the 10 m pixel scale
+    transform_gdal = data_20_bands.GetGeoTransform()
+    transform=rasterio.Affine(transform_gdal[1],transform_gdal[2],transform_gdal[0],transform_gdal[4],transform_gdal[5],transform_gdal[3])  
+    mask_file=temporary_directory+file_name+'_temp_mask.tif'
+    result_file = rasterio.open(mask_file,'w',driver='GTiff',
+                            height=SCL.shape[0],width=SCL.shape[1],count=1,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform)
+    result_file.write(SCL,1)
+    result_file.close()
+    #Get the information of the 10m images and wrap the SLC band to a 10 m pixel resolution
+    transform_gdal2 = data_10_bands.GetGeoTransform()
+    transform2=rasterio.Affine(transform_gdal2[1],transform_gdal2[2],transform_gdal2[0],transform_gdal2[4],transform_gdal2[5],transform_gdal2[3])  
+    minx = transform_gdal2[0]
+    maxy = transform_gdal2[3]
+    maxx = minx + transform_gdal2[1] * data_10_bands.RasterXSize
+    miny = maxy + transform_gdal2[5] * data_10_bands.RasterYSize
+    options="-te {0} {1} {2} {3} -ts {4} {5}".format(minx,miny,maxx,maxy,data_10_bands.RasterXSize,data_10_bands.RasterYSize)
+    final_mask=temporary_directory+file_name+'_mask_10m.tif'
+    mask = gdal.Warp(final_mask,mask_file, options=options)
+    mask_array=mask.ReadAsArray()
+    mask_array[mask_array<=3]=0
+    mask_array[mask_array>7]=0
+    mask_array[mask_array>0]=1
+    mask_file2=temporary_directory+file_name+'_mask_binary.tif'
+    result_file = rasterio.open(mask_file2,'w',driver='GTiff',
+                            height=mask_array.shape[0],width=mask_array.shape[1],count=1,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform2)
+    result_file.write(mask_array,1)
+    result_file.close()
+    final_image=data_10_bands_array*mask_array
+    clean_image=output_directory+file_name+'.tif'
+    result_file = rasterio.open(clean_image,'w',driver='GTiff',
+                            height=final_image.shape[1],width=final_image.shape[2],count=4,dtype=np.dtype('uint16'),
+                            crs=sentinel_crs, transform=transform2)
+    result_file.write(final_image[0],1)
+    result_file.write(final_image[1],2)
+    result_file.write(final_image[2],3)
+    result_file.write(final_image[3],4)
+    result_file.close()
+    print("Image "+file_name+" preprocess complete")
+    if output==True:
+        return(final_image)
+
+def Sentinel2_NDVI_composite(input_files,file_name,temporary_directory,output_directory): 
+    #The function takes a list of Sentinel2 raster tiff files
+    #Create a temporary file with the complete extent of all the input images
+    files_list = []
+    for file in input_files:
+        input_file = rasterio.open(file)
+        files_list.append(input_file)
+    total_mosaic, out_trans = merge(files_list)
+    #Save the total extent array to a file
+    temp_mosaic_file=temporary_directory+"temp_mosaic_extent.tif"
+    temp_mosaic = rasterio.open(temp_mosaic_file,'w',driver='GTiff',
+                            height=total_mosaic.shape[1],width=total_mosaic.shape[2],count=4,dtype=np.dtype('uint16'),
+                            crs=files_list[0].crs, transform=out_trans)
+    temp_mosaic.write(total_mosaic[0]*0,1)
+    temp_mosaic.write(total_mosaic[1]*0,2)
+    temp_mosaic.write(total_mosaic[2]*0,3)
+    temp_mosaic.write(total_mosaic[3]*0,4)
+    temp_mosaic.close()  
+    temp_mosaic=rasterio.open(temp_mosaic_file)
+    #Merge each of the blue, green, red and nir bands of the input file with the temporary mosaic    
+    #input_file = rasterio.open(file)
+    #Put all the bands from the input files, which should be only four into a temporary file
+    temp_file=rasterio.open(input_files[0])
+    large_input_array, out_trans = merge([temp_file, temp_mosaic])
+    temp_blue=large_input_array[0].ravel()
+    temp_green=large_input_array[1].ravel()
+    temp_red=large_input_array[2].ravel()
+    temp_nir=large_input_array[3].ravel()
+    #I had to add this step because some images have a zero value in most bands but not in all
+    temp_mask=temp_blue*temp_green*temp_red*temp_nir
+    temp_blue[temp_mask==0]=34463 
+    temp_green[temp_mask==0]=34463 
+    temp_red[temp_mask==0]=34463
+    temp_nir[temp_mask==0]=34463
+    #temp_nir=temp_nir.reshape((temp_nir.shape[0], temp_nir.shape[1], 1))
+    temp_ndvi=(temp_nir-temp_red)/(temp_nir+temp_red)
+    #temp_ndvi[temp_ndvi==0]=99999
+    for i in range(len(input_files)-1):
+        print("Processing image "+ str(i+2)+" of "+str(len(input_files)))
+        temp_file=rasterio.open(input_files[i+1])
+        large_input_array, out_trans = merge([temp_file, temp_mosaic])
+        blue=large_input_array[0].ravel()
+        green=large_input_array[1].ravel()
+        red=large_input_array[2].ravel()
+        nir=large_input_array[3].ravel()
+        temp_mask2=blue*green*red*nir
+        blue[temp_mask2==0]=34463
+        green[temp_mask2==0]=34463
+        red[temp_mask2==0]=34463
+        nir[temp_mask2==0]=34463
+        ndvi=(nir-red)/(nir+red)
+        temp_blue= np.column_stack((temp_blue,blue))
+        temp_green= np.column_stack((temp_green,green))
+        temp_red= np.column_stack((temp_red,red))
+        temp_nir= np.column_stack((temp_nir,nir))
+        temp_ndvi=np.column_stack((temp_ndvi,ndvi))
+    #calculate which pixel has the max NDVI value
+    #temp_ndvi.columns = range(temp_ndvi.shape[1])
+    temp_ndvi_max=temp_ndvi.max(axis=1)
+    temp_ndvi_max[temp_ndvi_max==0]=34463
+    temp_ndvi_max=temp_ndvi_max.reshape(temp_ndvi_max.shape[0],1)
+    #Create a binary mask dataframe
+    mask=temp_ndvi/temp_ndvi_max
+    mask[mask<1]=0
+    temp_blue[temp_blue==34463]=0
+    final_blue=np.max(temp_blue*mask, axis=1)
+    temp_green[temp_green==34463]=0
+    final_green=np.max(temp_green*mask, axis=1)
+    temp_red[temp_red==34463]=0
+    final_red=np.max(temp_red*mask, axis=1)
+    temp_nir[temp_nir==34463]=0
+    final_nir=np.max(temp_nir*mask, axis=1)
+    final_blue=final_blue.reshape(temp_mosaic.shape[0], temp_mosaic.shape[1])
+    final_green=final_green.reshape(temp_mosaic.shape[0], temp_mosaic.shape[1])
+    final_red=final_red.reshape(temp_mosaic.shape[0], temp_mosaic.shape[1])
+    final_nir=final_nir.reshape(temp_mosaic.shape[0], temp_mosaic.shape[1])
+    mosaic_file=output_directory+file_name+'.tif'
+    result_file = rasterio.open(mosaic_file,'w',driver='GTiff',
+                            height=final_blue.shape[0],width=final_blue.shape[1],count=4,dtype=np.dtype('uint16'),
+                            crs=temp_mosaic.crs, transform=temp_mosaic.transform)
+    result_file.write(final_blue,1)
+    result_file.write(final_green,2)
+    result_file.write(final_red,3)
+    result_file.write(final_nir,4)
+    result_file.close()
+    print("Image "+file_name+" NDVI Mosaic complete")
+
+
